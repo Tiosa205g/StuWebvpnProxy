@@ -1,0 +1,9 @@
+[project]
+name = "webvpn-proxy"
+version = "1.0.0"
+description = "WebVPN HTTP reverse proxy with cookie injection"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "multidict>=6.0,<7",
+]
