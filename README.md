@@ -86,7 +86,7 @@ uv run python proxy.py
 | `PROXY_PORT`       | `8118`                       | 监听端口                                   |
 | `ALLOWED_REGEX`    | `^.+\.webvpn\.stu\.edu\.cn$` | 允许转发的主机名正则                       |
 | `UPSTREAM_TIMEOUT` | `30`                         | 上游请求超时秒数                           |
-| `LOG_LEVEL`        | `INFO`                       | 日志级别（DEBUG / INFO / WARNING / ERROR） |
+| `LOG_LEVEL`        | `WARNING`                    | 日志级别（DEBUG / INFO / WARNING / ERROR） |
 
 示例：
 

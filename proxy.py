@@ -30,7 +30,7 @@ UPSTREAM_TIMEOUT = int(os.getenv('UPSTREAM_TIMEOUT', '30'))
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper()),
+    level=getattr(logging, os.getenv('LOG_LEVEL', 'WARNING').upper()),
     format='%(asctime)s [%(levelname)s] %(message)s',
 )
 log = logging.getLogger('webvpn-proxy')
