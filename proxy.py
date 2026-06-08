@@ -112,9 +112,19 @@ async def handle(request: web.Request) -> web.Response:
 
             out_hdrs: CIMultiDict[str] = CIMultiDict()
             skip_rsp = {'transfer-encoding', 'connection'}
+            strip_rsp = skip_rsp | {
+                'content-security-policy',
+                'content-security-policy-report-only',
+                'access-control-allow-origin',
+                'access-control-allow-credentials',
+                'access-control-allow-methods',
+                'access-control-allow-headers',
+                'access-control-expose-headers',
+                'access-control-max-age',
+            }
             for k, v in resp.headers.items():
                 kl = k.lower()
-                if kl in skip_rsp or kl == 'set-cookie':
+                if kl in strip_rsp or kl == 'set-cookie':
                     continue
                 out_hdrs.add(k, v)
 
