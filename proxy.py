@@ -22,6 +22,12 @@ LISTEN_PORT = int(os.getenv('PROXY_PORT', '8118'))
 
 ALLOWED_REGEX = os.getenv('ALLOWED_REGEX', r'^.+\.webvpn\.stu\.edu\.cn$')
 
+# Hostname pattern for webvpn to extract real upstream.
+# e.g. www-bilibili-com-s.webvpn.stu.edu.cn → www.bilibili.com
+# NOTE: Not used for forwarding (keeps traffic through webvpn for 免流).
+# Used only for HTML URL rewriting.
+WEBVPN_HOST_RE = re.compile(r'^(.+)-s\.webvpn\.stu\.edu\.cn$')
+
 INJECT_COOKIES: Dict[str, str] = {
     # 'SESSION': 'abc123',
 }
@@ -38,6 +44,12 @@ log = logging.getLogger('webvpn-proxy')
 _ALLOWED_RE = re.compile(ALLOWED_REGEX)
 _INJECTED_NAMES: set = set(INJECT_COOKIES.keys())
 _SESSION: Optional[ClientSession] = None
+
+# Runtime cookie store: captures Set-Cookie from webvpn upstream and
+# re-injects them on every request.  Fixes same‑site / domain‑scoping
+# issues where the browser doesn't send the webvpn session cookie for
+# cross‑subdomain sub‑resource requests (fonts, JS chunks, etc.).
+_WEBVPN_COOKIE_STORE: Dict[str, str] = {}
 
 
 def _host_allowed(host: str) -> bool:
@@ -60,6 +72,33 @@ async def _get_session() -> ClientSession:
     return _SESSION
 
 
+def _extract_upstream(host: str) -> Optional[str]:
+    hostname = host.split(':')[0] if ':' in host else host
+    m = WEBVPN_HOST_RE.match(hostname)
+    if not m:
+        return None
+    return m.group(1).replace('-', '.')
+
+
+_BI_DOMAINS = re.compile(
+    r'(https?://|//)([a-z0-9_-]+\.(?:bilibili\.com|hdslb\.com|bilicdn1\.com))'
+    r'(?=[/\"\'\?\&\#\s;])',
+    re.IGNORECASE,
+)
+
+
+def _rewrite_html(html: str, proxy_host: str) -> str:
+    proxy_hostname = proxy_host.split(':')[0] if ':' in proxy_host else proxy_host
+
+    def _replacer(m: re.Match) -> str:
+        scheme = m.group(1)
+        domain = m.group(2)
+        webvpn_domain = domain.replace('.', '-') + '-s.webvpn.stu.edu.cn'
+        return f'{scheme}{webvpn_domain}:8118'
+
+    return _BI_DOMAINS.sub(_replacer, html)
+
+
 def _cors_headers(origin: str) -> dict:
     return {
         'Access-Control-Allow-Origin': origin,
@@ -76,7 +115,8 @@ async def handle(request: web.Request) -> web.Response:
         return web.Response(status=403, text='Forbidden')
 
     upstream = f'http://{host}{request.path_qs}'
-    log.info('PROXY %s %s', request.method, upstream)
+    real_host = _extract_upstream(host)
+    log.info('PROXY %s %s  (real=%s)', request.method, upstream, real_host or '-')
 
     # Handle CORS preflight directly (no upstream forwarding)
     if request.method == 'OPTIONS':
@@ -94,7 +134,25 @@ async def handle(request: web.Request) -> web.Response:
         if k.lower() not in skip_req:
             hdrs.add(k, v)
 
-    hdrs['Cookie'] = _merge_cookie(request.headers.get('Cookie', ''))
+    cookie = request.headers.get('Cookie', '')
+    # Capture webvpn session cookie from the browser request and stash it
+    # for re‑injection.  The browser sets TWFID on the portal domain but
+    # may not send it to sub‑domains for sub‑resource requests.
+    for part in cookie.split(';'):
+        part = part.strip()
+        if '=' not in part:
+            continue
+        k, v = part.split('=', 1)
+        if k.upper() in ('TWFID', 'JSESSIONID', 'SESSION', 'TOKEN', 'AUTH'):
+            if k not in _WEBVPN_COOKIE_STORE:
+                _WEBVPN_COOKIE_STORE[k] = v
+                log.debug('Captured webvpn cookie %s from browser', k)
+    # Inject runtime‑captured cookies the browser didn't send.
+    for k, v in _WEBVPN_COOKIE_STORE.items():
+        if k not in cookie:
+            cookie = f'{cookie}; {k}={v}' if cookie else f'{k}={v}'
+            log.debug('Injected stored cookie %s for %s', k, host)
+    hdrs['Cookie'] = _merge_cookie(cookie)
 
     body = await request.read()
 
@@ -106,9 +164,17 @@ async def handle(request: web.Request) -> web.Response:
             headers=hdrs,
             data=body,
             timeout=ClientTimeout(total=UPSTREAM_TIMEOUT),
-            allow_redirects=False,
+            allow_redirects=True,
         ) as resp:
             resp_body = await resp.read()
+
+            if real_host and resp_body:
+                ct = resp.headers.get('Content-Type', '')
+                if 'text/html' in ct:
+                    body_str = resp_body.decode('utf-8', errors='replace')
+                    body_str = _rewrite_html(body_str, host)
+                    resp_body = body_str.encode('utf-8')
+                    log.debug('Rewrote HTML URLs (%d bytes)', len(resp_body))
 
             out_hdrs: CIMultiDict[str] = CIMultiDict()
             skip_rsp = {'transfer-encoding', 'connection'}
@@ -134,10 +200,20 @@ async def handle(request: web.Request) -> web.Response:
             origin = request.headers.get('Origin', '*')
             out_hdrs.update(_cors_headers(origin))
 
-            injected = set(INJECT_COOKIES.keys())
+            # Capture webvpn session cookies from upstream and re‑inject
+            # them on subsequent requests (handles cross‑subdomain cookie
+            # scoping that the browser can't do).
             for sc in resp.headers.getall('set-cookie', []):
-                if sc.split('=', 1)[0].strip() not in injected:
-                    out_hdrs.add('Set-Cookie', sc)
+                name = sc.split('=', 1)[0].strip()
+                if name in _INJECTED_NAMES:
+                    continue
+                out_hdrs.add('Set-Cookie', sc)
+                # Only store cookies that look like auth tokens (short, no
+                # sub‑domain indicator) for re‑injection.
+                if name.upper() in ('TWFID', 'JSESSIONID', 'SESSION', 'TOKEN', 'AUTH'):
+                    val = sc.split(';', 1)[0].split('=', 1)[1] if '=' in sc else ''
+                    _WEBVPN_COOKIE_STORE[name] = val
+                    log.debug('Stored webvpn cookie %s for re‑injection', name)
 
             return web.Response(
                 status=resp.status,
@@ -168,7 +244,7 @@ def main() -> None:
     log.info('Allowed pattern: %s', ALLOWED_REGEX)
     log.info('Injected cookies: %s', list(_INJECTED_NAMES) or '(none)')
 
-    web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT)
+    web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, max_line_size=65536)
 
 
 if __name__ == '__main__':
