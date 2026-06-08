@@ -60,6 +60,15 @@ async def _get_session() -> ClientSession:
     return _SESSION
 
 
+def _cors_headers(origin: str) -> dict:
+    return {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
+        'Access-Control-Max-Age': '86400',
+    }
+
+
 async def handle(request: web.Request) -> web.Response:
     host = request.host
     if not _host_allowed(host):
@@ -68,6 +77,15 @@ async def handle(request: web.Request) -> web.Response:
 
     upstream = f'http://{host}{request.path_qs}'
     log.info('PROXY %s %s', request.method, upstream)
+
+    # Handle CORS preflight directly (no upstream forwarding)
+    if request.method == 'OPTIONS':
+        origin = request.headers.get('Origin', '*')
+        hdrs = _cors_headers(origin)
+        req_hdrs = request.headers.get('Access-Control-Request-Headers')
+        if req_hdrs:
+            hdrs['Access-Control-Allow-Headers'] = req_hdrs
+        return web.Response(status=204, headers=hdrs)
 
     hdrs: CIMultiDict[str] = CIMultiDict()
     skip_req = {'host', 'connection', 'transfer-encoding', 'proxy-connection',
@@ -99,6 +117,12 @@ async def handle(request: web.Request) -> web.Response:
                 if kl in skip_rsp or kl == 'set-cookie':
                     continue
                 out_hdrs.add(k, v)
+
+            # Add CORS headers — proxy consolidates multiple upstream
+            # subdomains under one origin, so the browser sees cross-origin
+            # requests that the upstream never expected.
+            origin = request.headers.get('Origin', '*')
+            out_hdrs.update(_cors_headers(origin))
 
             injected = set(INJECT_COOKIES.keys())
             for sc in resp.headers.getall('set-cookie', []):
