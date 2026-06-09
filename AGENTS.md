@@ -13,16 +13,18 @@ No test/lint/typecheck tooling configured. No codegen, migrations, or build step
 
 ## Configuration
 
-Edit `proxy.py` top section or set env vars:
+Edit `config.json` (or set env vars which override the file):
 
-| Env var | Default | |
-|---|---|---|
-| `PROXY_HOST` | `0.0.0.0` | |
-| `PROXY_PORT` | `8118` | |
-| `ALLOWED_REGEX` | `^.+\.webvpn\.stu\.edu\.cn$` | |
-| `UPSTREAM_TIMEOUT` | `30` | |
-| `LOG_LEVEL` | `INFO` | |
-| `INJECT_COOKIES` | dict in code | Cookie key=value pairs to inject |
+| Key (config.json) | Env var | Default | |
+|---|---|---|---|
+| `listen_host` | `PROXY_HOST` | `0.0.0.0` | |
+| `listen_port` | `PROXY_PORT` | `8118` | |
+| `allowed_regex` | `ALLOWED_REGEX` | `^.+\.webvpn\.stu\.edu\.cn$` | |
+| `inject_cookies` | — | `{}` | Object of cookie key=value pairs |
+| `upstream_timeout` | `UPSTREAM_TIMEOUT` | `30` | seconds |
+| `log_level` | `LOG_LEVEL` | `INFO` | |
+
+The proxy looks for `config.json` in the working directory. A different path can be set via the `CONFIG_PATH` env var.
 
 ## Architecture
 

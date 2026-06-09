@@ -8,19 +8,49 @@ Set-Cookie from upstream responses to prevent leakage.
 """
 
 import asyncio
+import json
 import os
 import re
 import logging
+from pathlib import Path
 from typing import Dict, Optional
 
 from aiohttp import web, ClientSession, ClientTimeout
 from multidict import CIMultiDict
 
-# ── Configuration ──────────────────────────────────────────────────────────
-LISTEN_HOST = os.getenv('PROXY_HOST', '0.0.0.0')
-LISTEN_PORT = int(os.getenv('PROXY_PORT', '8118'))
+# ── Configuration (file + env overrides) ───────────────────────────────────
+_CONFIG_PATH = Path(os.getenv('CONFIG_PATH', 'config.json'))
 
-ALLOWED_REGEX = os.getenv('ALLOWED_REGEX', r'^.+\.webvpn\.stu\.edu\.cn$')
+_CONFIG_DEFAULTS = {
+    'listen_host': '0.0.0.0',
+    'listen_port': 8118,
+    'allowed_regex': r'^.+\.webvpn\.stu\.edu\.cn$',
+    'inject_cookies': {},
+    'upstream_timeout': 30,
+    'log_level': 'INFO',
+}
+
+_config = dict(_CONFIG_DEFAULTS)
+if _CONFIG_PATH.exists():
+    try:
+        with open(_CONFIG_PATH, encoding='utf-8') as f:
+            _config.update(json.load(f))
+    except Exception as exc:
+        print(f'[proxy] Warning: failed to load {_CONFIG_PATH}: {exc}')
+
+# Env overrides (env wins over config file)
+_config['listen_host'] = os.getenv('PROXY_HOST', _config['listen_host'])
+_config['listen_port'] = int(os.getenv('PROXY_PORT', _config['listen_port']))
+_config['allowed_regex'] = os.getenv('ALLOWED_REGEX', _config['allowed_regex'])
+_config['upstream_timeout'] = int(os.getenv('UPSTREAM_TIMEOUT', _config['upstream_timeout']))
+_config['log_level'] = os.getenv('LOG_LEVEL', _config['log_level']).upper()
+
+LISTEN_HOST: str = _config['listen_host']
+LISTEN_PORT: int = _config['listen_port']
+ALLOWED_REGEX: str = _config['allowed_regex']
+INJECT_COOKIES: Dict[str, str] = _config['inject_cookies']
+UPSTREAM_TIMEOUT: int = _config['upstream_timeout']
+LOG_LEVEL: str = _config['log_level']
 
 # Hostname pattern for webvpn to extract real upstream.
 # e.g. www-bilibili-com-s.webvpn.stu.edu.cn → www.bilibili.com
@@ -28,15 +58,9 @@ ALLOWED_REGEX = os.getenv('ALLOWED_REGEX', r'^.+\.webvpn\.stu\.edu\.cn$')
 # Used only for HTML URL rewriting.
 WEBVPN_HOST_RE = re.compile(r'^(.+)-s\.webvpn\.stu\.edu\.cn$')
 
-INJECT_COOKIES: Dict[str, str] = {
-    # 'SESSION': 'abc123',
-}
-
-UPSTREAM_TIMEOUT = int(os.getenv('UPSTREAM_TIMEOUT', '30'))
-
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=getattr(logging, os.getenv('LOG_LEVEL', 'WARNING').upper()),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s [%(levelname)s] %(message)s',
 )
 log = logging.getLogger('webvpn-proxy')

@@ -1,0 +1,8 @@
+{
+    "listen_host": "0.0.0.0",
+    "listen_port": 8118,
+    "allowed_regex": "^.+\\.webvpn\\.stu\\.edu\\.cn$",
+    "inject_cookies": {},
+    "upstream_timeout": 30,
+    "log_level": "INFO"
+}
