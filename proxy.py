@@ -168,7 +168,7 @@ async def handle(request: web.Request) -> web.Response:
             continue
         k, v = part.split('=', 1)
         if k.upper() in ('TWFID', 'JSESSIONID', 'SESSION', 'TOKEN', 'AUTH'):
-            if k not in _WEBVPN_COOKIE_STORE:
+            if k not in _WEBVPN_COOKIE_STORE or _WEBVPN_COOKIE_STORE[k] != v:
                 _WEBVPN_COOKIE_STORE[k] = v
                 log.debug('Captured webvpn cookie %s from browser', k)
     # Inject runtime‑captured cookies the browser didn't send.
