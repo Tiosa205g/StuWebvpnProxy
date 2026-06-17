@@ -96,6 +96,77 @@ async def _get_session() -> ClientSession:
     return _SESSION
 
 
+async def _probe_file_size(session: ClientSession, url: str, hdrs: CIMultiDict) -> Optional[int]:
+    """Probe file size via Range request to get total from Content-Range.
+
+    Sends Range: bytes=0-0 which returns 206 with Content-Range header.
+    Format: "bytes 0-{size-1}/{total}"
+    Extracts the total file size.
+
+    Falls back to HEAD probe if Range probe fails.
+    Returns the file size in bytes, or None if unknown.
+    """
+    # Try Range: bytes=0-0 probe first (more reliable than HEAD for Cloudflare)
+    try:
+        range_hdrs = CIMultiDict(hdrs)
+        range_hdrs['Range'] = 'bytes=0-0'
+        async with session.get(
+            url,
+            headers=range_hdrs,
+            timeout=ClientTimeout(total=10),
+            allow_redirects=True,
+        ) as range_resp:
+            cr = range_resp.headers.get('Content-Range', '')
+            if range_resp.status == 206 and cr:
+                # Parse "bytes 0-0/2506198781" → total = 2506198781
+                try:
+                    total = int(cr.split('/', 1)[1])
+                    if total > 0:
+                        log.info('Range probe: total file size = %d bytes for %s', total, url)
+                        return total
+                except Exception:
+                    pass
+            log.info('Range probe returned no Content-Range for %s (status=%d)', url, range_resp.status)
+    except Exception as e:
+        log.info('Range probe failed for %s: %s', url, e)
+
+    # Fallback: try HEAD probe
+    try:
+        head_hdrs = CIMultiDict(hdrs)
+        head_hdrs.pop('range', None)
+        async with session.head(
+            url,
+            headers=head_hdrs,
+            timeout=ClientTimeout(total=10),
+            allow_redirects=True,
+        ) as head_resp:
+            cl = head_resp.headers.get('Content-Length', '')
+            if cl.isdigit() and int(cl) > 0:
+                return int(cl)
+            log.info('HEAD probe returned no Content-Length for %s (status=%d)', url, head_resp.status)
+    except Exception as e:
+        log.info('HEAD probe failed for %s: %s', url, e)
+    return None
+
+
+def _parse_content_range_size(content_range: str) -> Optional[int]:
+    """Parse byte count from Content-Range header.
+
+    Format: "bytes start-end/total"
+    Returns the number of bytes in the range (end - start + 1), or None.
+    """
+    try:
+        # "bytes 0-2506198780/2506198781"
+        range_part, total = content_range.split('/', 1)
+        byte_range = range_part.split(' ', 1)[1]  # "0-2506198780"
+        start_str, end_str = byte_range.split('-')
+        start = int(start_str)
+        end = int(end_str)
+        return end - start + 1
+    except Exception:
+        return None
+
+
 def _extract_upstream(host: str) -> Optional[str]:
     hostname = host.split(':')[0] if ':' in host else host
     m = WEBVPN_HOST_RE.match(hostname)
@@ -180,6 +251,13 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
     body = await request.read()
 
+    # Log request details for debugging download manager issues
+    range_val = hdrs.get('Range', hdrs.get('range', ''))
+    accept_enc = hdrs.get('Accept-Encoding', hdrs.get('accept-encoding', ''))
+    if range_val:
+        log.info('RANGE_REQ %s %s Range=%s Accept-Encoding=%s', request.method, upstream,
+                 range_val, accept_enc or '(none)')
+
     try:
         session = await _get_session()
         async with session.request(
@@ -190,6 +268,19 @@ async def handle(request: web.Request) -> web.StreamResponse:
             timeout=ClientTimeout(total=None, sock_read=UPSTREAM_TIMEOUT),
             allow_redirects=True,
         ) as resp:
+            # Log upstream response status and key headers for debugging
+            content_range = resp.headers.get('Content-Range', '')
+            content_length = resp.headers.get('Content-Length', '')
+            accept_ranges = resp.headers.get('Accept-Ranges', '')
+            # Only log at INFO when it's a range-related response or has no Content-Length
+            # (normal HTML/text responses don't need this logging)
+            if content_range or not content_length:
+                log.info('RANGE_RESP %s status=%d Content-Range=%s Content-Length=%s Accept-Ranges=%s',
+                         upstream, resp.status,
+                         content_range or '(none)', content_length or '(none)',
+                         accept_ranges or '(none)')
+
+            # Build output headers
             out_hdrs: CIMultiDict[str] = CIMultiDict()
             skip_rsp = {'transfer-encoding', 'connection'}
             strip_rsp = skip_rsp | {
@@ -246,18 +337,57 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 )
 
             # Non-HTML: stream directly without buffering
+            #
+            # For download managers (e.g. Ghost-Downloader-3) to show progress,
+            # they need Content-Length or Content-Range (from 206).  When the
+            # upstream returns transfer-encoding: chunked without Content-Length,
+            # we probe with a Range: bytes=0-0 request to get total size from
+            # Content-Range, then add Content-Length to the response so the
+            # client can show a progress bar.
+            ct_lower = ct.lower()
+            has_content_length = 'content-length' in {k.lower() for k in out_hdrs}
+
+            # For 206 range responses: parse Content-Range and set Content-Length
+            # so aiohttp doesn't use chunked encoding (which causes errors when
+            # the client disconnects mid-stream).
+            if resp.status == 206:
+                cr = resp.headers.get('Content-Range', '')
+                range_size = _parse_content_range_size(cr)
+                if range_size is not None:
+                    out_hdrs['Content-Length'] = str(range_size)
+                    log.info('206 fix: set Content-Length=%d from Content-Range for %s', range_size, upstream)
+                # Also set Accept-Ranges if missing (some clients check this)
+                if 'accept-ranges' not in {k.lower() for k in out_hdrs}:
+                    out_hdrs['Accept-Ranges'] = 'bytes'
+            elif not has_content_length:
+                # No Content-Length and not a 206 → try Range probe to get total size
+                file_size = await _probe_file_size(session, upstream, hdrs)
+                if file_size is not None:
+                    out_hdrs['Content-Length'] = str(file_size)
+                    log.info('Probe fix: set Content-Length=%d for %s', file_size, upstream)
+
             resp_obj = web.StreamResponse(
                 status=resp.status,
                 headers=out_hdrs,
             )
             await resp_obj.prepare(request)
-            async for chunk in resp.content.iter_chunked(65536):
-                await resp_obj.write(chunk)
+            try:
+                async for chunk in resp.content.iter_chunked(65536):
+                    await resp_obj.write(chunk)
+            except Exception:
+                # Client disconnected or write failed — finalize gracefully
+                pass
             return resp_obj
     except asyncio.TimeoutError:
         log.error('TIMEOUT %s', upstream)
         return web.Response(status=504, text='Gateway Timeout')
     except Exception as e:
+        # ClientConnectionResetError is normal when the client disconnects
+        # mid-stream (e.g. download manager closes connection after getting
+        # file size, or user cancels download). Don't log as error.
+        if 'ClientConnectionResetError' in type(e).__name__ or 'closing transport' in str(e):
+            log.debug('Client disconnected: %s', upstream)
+            return web.Response(status=200)
         log.exception('UPSTREAM_ERR %s', upstream)
         return web.Response(status=502, text=f'Bad Gateway: {e}')
 

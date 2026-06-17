@@ -1,2 +1,4 @@
 *.txt
 .playwright-mcp/
+.omo/
+__pycache__/
