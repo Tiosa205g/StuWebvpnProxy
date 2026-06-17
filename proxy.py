@@ -132,7 +132,7 @@ def _cors_headers(origin: str) -> dict:
     }
 
 
-async def handle(request: web.Request) -> web.Response:
+async def handle(request: web.Request) -> web.StreamResponse:
     host = request.host
     if not _host_allowed(host):
         log.warning('REJECT %s %s', request.method, host)
@@ -187,19 +187,9 @@ async def handle(request: web.Request) -> web.Response:
             url=upstream,
             headers=hdrs,
             data=body,
-            timeout=ClientTimeout(total=UPSTREAM_TIMEOUT),
+            timeout=ClientTimeout(total=None, sock_read=UPSTREAM_TIMEOUT),
             allow_redirects=True,
         ) as resp:
-            resp_body = await resp.read()
-
-            if real_host and resp_body:
-                ct = resp.headers.get('Content-Type', '')
-                if 'text/html' in ct:
-                    body_str = resp_body.decode('utf-8', errors='replace')
-                    body_str = _rewrite_html(body_str, host)
-                    resp_body = body_str.encode('utf-8')
-                    log.debug('Rewrote HTML URLs (%d bytes)', len(resp_body))
-
             out_hdrs: CIMultiDict[str] = CIMultiDict()
             skip_rsp = {'transfer-encoding', 'connection'}
             strip_rsp = skip_rsp | {
@@ -239,11 +229,31 @@ async def handle(request: web.Request) -> web.Response:
                     _WEBVPN_COOKIE_STORE[name] = val
                     log.debug('Stored webvpn cookie %s for re‑injection', name)
 
-            return web.Response(
+            # Stream large binaries (wheels, tarballs, etc.); buffer only
+            # HTML content for URL rewriting.
+            ct = resp.headers.get('Content-Type', '')
+            if real_host and 'text/html' in ct:
+                resp_body = await resp.read()
+                if resp_body:
+                    body_str = resp_body.decode('utf-8', errors='replace')
+                    body_str = _rewrite_html(body_str, host)
+                    resp_body = body_str.encode('utf-8')
+                    log.debug('Rewrote HTML URLs (%d bytes)', len(resp_body))
+                return web.Response(
+                    status=resp.status,
+                    body=resp_body,
+                    headers=out_hdrs,
+                )
+
+            # Non-HTML: stream directly without buffering
+            resp_obj = web.StreamResponse(
                 status=resp.status,
-                body=resp_body,
                 headers=out_hdrs,
             )
+            await resp_obj.prepare(request)
+            async for chunk in resp.content.iter_chunked(65536):
+                await resp_obj.write(chunk)
+            return resp_obj
     except asyncio.TimeoutError:
         log.error('TIMEOUT %s', upstream)
         return web.Response(status=504, text='Gateway Timeout')
