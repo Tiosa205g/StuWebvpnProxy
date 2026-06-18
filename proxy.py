@@ -194,13 +194,16 @@ def _rewrite_html(html: str, proxy_host: str) -> str:
     return _BI_DOMAINS.sub(_replacer, html)
 
 
-def _cors_headers(origin: str) -> dict:
-    return {
+def _cors_headers(origin: str) -> CIMultiDict:
+    hdrs = CIMultiDict({
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range, X-Requested-With',
         'Access-Control-Max-Age': '86400',
-    }
+        'Vary': 'Origin',
+    })
+    return hdrs
 
 
 async def handle(request: web.Request) -> web.StreamResponse:
@@ -223,8 +226,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
         return web.Response(status=204, headers=hdrs)
 
     hdrs: CIMultiDict[str] = CIMultiDict()
+    # Strip webvpn‑injected headers (sdp-app-session is added by the Sangfor
+    # client‑side script web_proxy.js to every XHR/fetch).  Forwarding these
+    # to the upstream can confuse servers like api.bilibili.com → 500 error.
     skip_req = {'host', 'connection', 'transfer-encoding', 'proxy-connection',
-                'keep-alive', 'upgrade', 'te', 'trailer'}
+                'keep-alive', 'upgrade', 'te', 'trailer',
+                'sdp-app-session', 'sdp-app-token', 'sdp-app-version'}
     for k, v in request.headers.items():
         if k.lower() not in skip_req:
             hdrs.add(k, v)
@@ -359,8 +366,10 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 # Also set Accept-Ranges if missing (some clients check this)
                 if 'accept-ranges' not in {k.lower() for k in out_hdrs}:
                     out_hdrs['Accept-Ranges'] = 'bytes'
-            elif not has_content_length:
-                # No Content-Length and not a 206 → try Range probe to get total size
+            elif not has_content_length and request.method in ('GET', 'HEAD'):
+                # No Content-Length and not a 206 → try Range probe to get total size.
+                # Only for safe methods (GET/HEAD) to avoid interfering with
+                # state-changing endpoints like POST /ogv/player/playview.
                 file_size = await _probe_file_size(session, upstream, hdrs)
                 if file_size is not None:
                     out_hdrs['Content-Length'] = str(file_size)
