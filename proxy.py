@@ -18,6 +18,13 @@ from typing import Dict, Optional
 from aiohttp import web, ClientSession, ClientTimeout
 from multidict import CIMultiDict
 
+# ── Logging (basic setup before config, so config errors can use log) ──────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+log = logging.getLogger('webvpn-proxy')
+
 # ── Configuration (file + env overrides) ───────────────────────────────────
 _CONFIG_PATH = Path(os.getenv('CONFIG_PATH', 'config.json'))
 
@@ -36,7 +43,7 @@ if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH, encoding='utf-8') as f:
             _config.update(json.load(f))
     except Exception as exc:
-        print(f'[proxy] Warning: failed to load {_CONFIG_PATH}: {exc}')
+        log.warning('[CONFIG] Failed to load %s: %s', _CONFIG_PATH, exc)
 
 # Env overrides (env wins over config file)
 _config['listen_host'] = os.getenv('PROXY_HOST', _config['listen_host'])
@@ -52,18 +59,14 @@ INJECT_COOKIES: Dict[str, str] = _config['inject_cookies']
 UPSTREAM_TIMEOUT: int = _config['upstream_timeout']
 LOG_LEVEL: str = _config['log_level']
 
+# Update log level after config is loaded
+log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
 # Hostname pattern for webvpn to extract real upstream.
 # e.g. www-bilibili-com-s.webvpn.stu.edu.cn → www.bilibili.com
 # NOTE: Not used for forwarding (keeps traffic through webvpn for 免流).
 # Used only for HTML URL rewriting.
 WEBVPN_HOST_RE = re.compile(r'^(.+)-s\.webvpn\.stu\.edu\.cn$')
-
-# ── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s [%(levelname)s] %(message)s',
-)
-log = logging.getLogger('webvpn-proxy')
 
 _ALLOWED_RE = re.compile(ALLOWED_REGEX)
 _INJECTED_NAMES: set = set(INJECT_COOKIES.keys())
@@ -122,13 +125,13 @@ async def _probe_file_size(session: ClientSession, url: str, hdrs: CIMultiDict) 
                 try:
                     total = int(cr.split('/', 1)[1])
                     if total > 0:
-                        log.info('Range probe: total file size = %d bytes for %s', total, url)
+                        log.debug('[PROBE] Range probe: total file size = %d bytes for %s', total, url)
                         return total
                 except Exception:
                     pass
-            log.info('Range probe returned no Content-Range for %s (status=%d)', url, range_resp.status)
+            log.debug('[PROBE] Range probe returned no Content-Range for %s (status=%d)', url, range_resp.status)
     except Exception as e:
-        log.info('Range probe failed for %s: %s', url, e)
+        log.debug('[PROBE] Range probe failed for %s: %s', url, e)
 
     # Fallback: try HEAD probe
     try:
@@ -143,9 +146,9 @@ async def _probe_file_size(session: ClientSession, url: str, hdrs: CIMultiDict) 
             cl = head_resp.headers.get('Content-Length', '')
             if cl.isdigit() and int(cl) > 0:
                 return int(cl)
-            log.info('HEAD probe returned no Content-Length for %s (status=%d)', url, head_resp.status)
+            log.debug('[PROBE] HEAD probe returned no Content-Length for %s (status=%d)', url, head_resp.status)
     except Exception as e:
-        log.info('HEAD probe failed for %s: %s', url, e)
+        log.debug('[PROBE] HEAD probe failed for %s: %s', url, e)
     return None
 
 
@@ -209,12 +212,12 @@ def _cors_headers(origin: str) -> CIMultiDict:
 async def handle(request: web.Request) -> web.StreamResponse:
     host = request.host
     if not _host_allowed(host):
-        log.warning('REJECT %s %s', request.method, host)
+        log.warning('[REJECT] %s %s', request.method, host)
         return web.Response(status=403, text='Forbidden')
 
     upstream = f'http://{host}{request.path_qs}'
     real_host = _extract_upstream(host)
-    log.info('PROXY %s %s  (real=%s)', request.method, upstream, real_host or '-')
+    log.info('[PROXY] %s %s  (real=%s)', request.method, upstream, real_host or '-')
 
     # Handle CORS preflight directly (no upstream forwarding)
     if request.method == 'OPTIONS':
@@ -248,12 +251,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if k.upper() in ('TWFID', 'JSESSIONID', 'SESSION', 'TOKEN', 'AUTH'):
             if k not in _WEBVPN_COOKIE_STORE or _WEBVPN_COOKIE_STORE[k] != v:
                 _WEBVPN_COOKIE_STORE[k] = v
-                log.debug('Captured webvpn cookie %s from browser', k)
+                log.debug('[COOKIE] Captured webvpn cookie %s from browser', k)
     # Inject runtime‑captured cookies the browser didn't send.
     for k, v in _WEBVPN_COOKIE_STORE.items():
         if k not in cookie:
             cookie = f'{cookie}; {k}={v}' if cookie else f'{k}={v}'
-            log.debug('Injected stored cookie %s for %s', k, host)
+            log.debug('[COOKIE] Injected stored cookie %s for %s', k, host)
     hdrs['Cookie'] = _merge_cookie(cookie)
 
     body = await request.read()
@@ -262,7 +265,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
     range_val = hdrs.get('Range', hdrs.get('range', ''))
     accept_enc = hdrs.get('Accept-Encoding', hdrs.get('accept-encoding', ''))
     if range_val:
-        log.info('RANGE_REQ %s %s Range=%s Accept-Encoding=%s', request.method, upstream,
+        log.debug('[RANGE] %s %s Range=%s Accept-Encoding=%s', request.method, upstream,
                  range_val, accept_enc or '(none)')
 
     try:
@@ -282,7 +285,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
             # Only log at INFO when it's a range-related response or has no Content-Length
             # (normal HTML/text responses don't need this logging)
             if content_range or not content_length:
-                log.info('RANGE_RESP %s status=%d Content-Range=%s Content-Length=%s Accept-Ranges=%s',
+                log.debug('[RANGE] %s status=%d Content-Range=%s Content-Length=%s Accept-Ranges=%s',
                          upstream, resp.status,
                          content_range or '(none)', content_length or '(none)',
                          accept_ranges or '(none)')
@@ -325,7 +328,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 if name.upper() in ('TWFID', 'JSESSIONID', 'SESSION', 'TOKEN', 'AUTH'):
                     val = sc.split(';', 1)[0].split('=', 1)[1] if '=' in sc else ''
                     _WEBVPN_COOKIE_STORE[name] = val
-                    log.debug('Stored webvpn cookie %s for re‑injection', name)
+                    log.debug('[COOKIE] Stored webvpn cookie %s for re-injection', name)
 
             # Stream large binaries (wheels, tarballs, etc.); buffer only
             # HTML content for URL rewriting.
@@ -336,7 +339,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
                     body_str = resp_body.decode('utf-8', errors='replace')
                     body_str = _rewrite_html(body_str, host)
                     resp_body = body_str.encode('utf-8')
-                    log.debug('Rewrote HTML URLs (%d bytes)', len(resp_body))
+                    log.debug('[REWRITE] Rewrote HTML URLs (%d bytes)', len(resp_body))
                 return web.Response(
                     status=resp.status,
                     body=resp_body,
@@ -362,7 +365,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 range_size = _parse_content_range_size(cr)
                 if range_size is not None:
                     out_hdrs['Content-Length'] = str(range_size)
-                    log.info('206 fix: set Content-Length=%d from Content-Range for %s', range_size, upstream)
+                    log.debug('[FIX] 206: set Content-Length=%d from Content-Range for %s', range_size, upstream)
                 # Also set Accept-Ranges if missing (some clients check this)
                 if 'accept-ranges' not in {k.lower() for k in out_hdrs}:
                     out_hdrs['Accept-Ranges'] = 'bytes'
@@ -373,7 +376,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 file_size = await _probe_file_size(session, upstream, hdrs)
                 if file_size is not None:
                     out_hdrs['Content-Length'] = str(file_size)
-                    log.info('Probe fix: set Content-Length=%d for %s', file_size, upstream)
+                    log.debug('[FIX] Probe: set Content-Length=%d for %s', file_size, upstream)
 
             resp_obj = web.StreamResponse(
                 status=resp.status,
@@ -388,16 +391,16 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 pass
             return resp_obj
     except asyncio.TimeoutError:
-        log.error('TIMEOUT %s', upstream)
+        log.error('[TIMEOUT] %s', upstream)
         return web.Response(status=504, text='Gateway Timeout')
     except Exception as e:
         # ClientConnectionResetError is normal when the client disconnects
         # mid-stream (e.g. download manager closes connection after getting
         # file size, or user cancels download). Don't log as error.
         if 'ClientConnectionResetError' in type(e).__name__ or 'closing transport' in str(e):
-            log.debug('Client disconnected: %s', upstream)
+            log.debug('[DISCONNECT] Client disconnected: %s', upstream)
             return web.Response(status=200)
-        log.exception('UPSTREAM_ERR %s', upstream)
+        log.exception('[ERROR] UPSTREAM_ERR %s', upstream)
         return web.Response(status=502, text=f'Bad Gateway: {e}')
 
 
@@ -413,9 +416,10 @@ def main() -> None:
     app.on_shutdown.append(cleanup)
     app.router.add_route('*', '/{path:.*}', handle)
 
-    log.info('Listening on %s:%s', LISTEN_HOST, LISTEN_PORT)
-    log.info('Allowed pattern: %s', ALLOWED_REGEX)
-    log.info('Injected cookies: %s', list(_INJECTED_NAMES) or '(none)')
+    log.info('[STARTUP] Listening on %s:%s', LISTEN_HOST, LISTEN_PORT)
+    log.info('[STARTUP] Allowed pattern: %s', ALLOWED_REGEX)
+    log.info('[STARTUP] Injected cookies: %s', list(_INJECTED_NAMES) or '(none)')
+    log.info('[STARTUP] Log level: %s', LOG_LEVEL)
 
     web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, max_line_size=65536)
 
